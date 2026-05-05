@@ -362,31 +362,23 @@ def wait_for_status_change(page, target_status: str, max_wait: int = 60000) -> s
     return detect_server_status(page)
 
 
-# ── 新增：唤醒逻辑 ─────────────────────────────────────
+# ── 新增：唤醒动作 ─────────────────────────────────────
 def send_wake_up_command(page) -> bool:
-    """执行唤醒操作"""
-    log_info("正在尝试触发 WAKE UP SERVER 按钮...")
+    """点击页面上的 WAKE UP SERVER 按钮"""
+    log_info("尝试执行 WAKE UP 唤醒操作...")
     try:
-        # 通过多种方式尝试定位那个黄色的唤醒按钮
+        # 寻找包含 "WAKE UP SERVER" 的按钮
         btn = page.locator('button:has-text("WAKE UP SERVER")').first
-        if not btn.is_visible():
-            # 备选：根据 HTML 结构中带图标的按钮定位
-            btn = page.locator('button:has(i.fa-rocket)').first
-            
         if btn.is_visible():
             btn.click()
-            log_info("已成功点击 WAKE UP SERVER 按钮")
+            log_info("成功点击唤醒按钮")
             return True
         else:
-            # 备选：通过 JS 强制点击
-            clicked = page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button'));
-                const wakeBtn = btns.find(b => b.innerText.includes('WAKE UP SERVER'));
-                if (wakeBtn) { wakeBtn.click(); return true; }
-                return false;
-            }""")
-            if clicked:
-                log_info("通过 JS 脚本点击了唤醒按钮")
+            # 备选：通过图标搜索按钮
+            btn_alt = page.locator('button i.fa-rocket').locator('xpath=..').first
+            if btn_alt.is_visible():
+                btn_alt.click()
+                log_info("通过图标找到并点击了唤醒按钮")
                 return True
     except Exception as e:
         log_warn(f"唤醒按钮点击异常: {e}")
@@ -501,20 +493,20 @@ def process_server(page, server_id: str) -> dict:
 
         current_state = detect_server_status(page)
         result["before_state"] = current_state
-        log_info(f"[{tag}] 当前状态: {current_state}")
+        log_info(f"[{tag}] 初始状态: {current_state}")
 
-        # --- 新增逻辑：处理休眠 ---
+        # --- 新增：处理休眠状态 ---
         if current_state == "hibernating":
-            log_info(f"[{tag}] 服务器处于休眠，正在执行唤醒...")
+            log_info(f"[{tag}] 服务器处于休眠，尝试唤醒...")
             if send_wake_up_command(page):
-                # 唤醒点击后，页面通常会进入加载或变为 stopped
+                # 唤醒后页面可能需要加载一段时间，等待 10 秒并重新获取状态
                 page.wait_for_timeout(10000)
                 current_state = detect_server_status(page)
-                log_info(f"[{tag}] 唤醒后检测状态为: {current_state}")
+                log_info(f"[{tag}] 唤醒点击后的状态为: {current_state}")
             else:
-                log_error(f"[{tag}] 无法点击唤醒按钮")
+                log_warn(f"[{tag}] 无法点击唤醒按钮")
 
-        # --- 原始逻辑：根据状态执行重启或开机 ---
+        # --- 后续正常电源逻辑 ---
         if current_state == "running":
             log_info(f"[{tag}] 服务器运行中，执行重启...")
             success = send_power_command_via_page(page, "restart")
@@ -536,8 +528,8 @@ def process_server(page, server_id: str) -> dict:
                               detail="无法触发重启命令")
 
         elif current_state == "stopped" or (result["before_state"] == "hibernating" and current_state != "running"):
-            # 如果原始是休眠，唤醒后一般是 stopped，所以也要执行开机
-            log_info(f"[{tag}] 服务器已关机/唤醒，执行开机...")
+            # 如果一开始是休眠，唤醒后通常是 stopped，所以此时需要执行开机
+            log_info(f"[{tag}] 服务器处于离线/已唤醒，执行开机...")
             success = send_power_command_via_page(page, "start")
             if success:
                 page.wait_for_timeout(5000)
