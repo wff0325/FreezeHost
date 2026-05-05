@@ -304,9 +304,15 @@ def discover_server_ids(page) -> list[str]:
 def detect_server_status(page) -> str:
     """
     检测服务器当前电源状态。
-    返回: "running" | "stopped" | "starting" | "stopping" | "unknown"
+    返回: "running" | "stopped" | "starting" | "stopping" | "hibernating" | "unknown"
     """
     status = page.evaluate("""() => {
+        // --- 新增：检测休眠状态 ---
+        const bodyText = document.body.innerText;
+        if (bodyText.includes('SERVER CURRENTLY IN HIBERNATION') || bodyText.includes('WAKE UP SERVER')) {
+            return 'hibernating';
+        }
+
         // 方法1: 检查 power-btn 文字
         const powerBtn = document.getElementById('power-btn');
         if (powerBtn) {
@@ -324,7 +330,7 @@ def detect_server_status(page) -> str:
         }
 
         // 方法3: 检查页面状态文字
-        const body = document.body.innerText.toLowerCase();
+        const body = bodyText.toLowerCase();
         if (body.includes('server is running') || body.includes('status: running')) return 'running';
         if (body.includes('server is offline') || body.includes('status: offline') || body.includes('server is stopped')) return 'stopped';
         if (body.includes('starting')) return 'starting';
@@ -354,6 +360,37 @@ def wait_for_status_change(page, target_status: str, max_wait: int = 60000) -> s
         if current == target_status:
             return current
     return detect_server_status(page)
+
+
+# ── 新增：唤醒逻辑 ─────────────────────────────────────
+def send_wake_up_command(page) -> bool:
+    """执行唤醒操作"""
+    log_info("正在尝试触发 WAKE UP SERVER 按钮...")
+    try:
+        # 通过多种方式尝试定位那个黄色的唤醒按钮
+        btn = page.locator('button:has-text("WAKE UP SERVER")').first
+        if not btn.is_visible():
+            # 备选：根据 HTML 结构中带图标的按钮定位
+            btn = page.locator('button:has(i.fa-rocket)').first
+            
+        if btn.is_visible():
+            btn.click()
+            log_info("已成功点击 WAKE UP SERVER 按钮")
+            return True
+        else:
+            # 备选：通过 JS 强制点击
+            clicked = page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const wakeBtn = btns.find(b => b.innerText.includes('WAKE UP SERVER'));
+                if (wakeBtn) { wakeBtn.click(); return true; }
+                return false;
+            }""")
+            if clicked:
+                log_info("通过 JS 脚本点击了唤醒按钮")
+                return True
+    except Exception as e:
+        log_warn(f"唤醒按钮点击异常: {e}")
+    return False
 
 
 def send_power_command_via_page(page, command: str) -> bool:
@@ -446,6 +483,7 @@ def _state_cn(state: str) -> str:
         "stopped": "关机",
         "starting": "启动中",
         "stopping": "关机中",
+        "hibernating": "休眠中",
         "unknown": "未知",
     }.get(state, state)
 
@@ -465,6 +503,18 @@ def process_server(page, server_id: str) -> dict:
         result["before_state"] = current_state
         log_info(f"[{tag}] 当前状态: {current_state}")
 
+        # --- 新增逻辑：处理休眠 ---
+        if current_state == "hibernating":
+            log_info(f"[{tag}] 服务器处于休眠，正在执行唤醒...")
+            if send_wake_up_command(page):
+                # 唤醒点击后，页面通常会进入加载或变为 stopped
+                page.wait_for_timeout(10000)
+                current_state = detect_server_status(page)
+                log_info(f"[{tag}] 唤醒后检测状态为: {current_state}")
+            else:
+                log_error(f"[{tag}] 无法点击唤醒按钮")
+
+        # --- 原始逻辑：根据状态执行重启或开机 ---
         if current_state == "running":
             log_info(f"[{tag}] 服务器运行中，执行重启...")
             success = send_power_command_via_page(page, "restart")
@@ -485,8 +535,9 @@ def process_server(page, server_id: str) -> dict:
                 result.update(status="restart_failed", emoji="❌", status_label="重启失败",
                               detail="无法触发重启命令")
 
-        elif current_state == "stopped":
-            log_info(f"[{tag}] 服务器已关机，执行开机...")
+        elif current_state == "stopped" or (result["before_state"] == "hibernating" and current_state != "running"):
+            # 如果原始是休眠，唤醒后一般是 stopped，所以也要执行开机
+            log_info(f"[{tag}] 服务器已关机/唤醒，执行开机...")
             success = send_power_command_via_page(page, "start")
             if success:
                 page.wait_for_timeout(5000)
