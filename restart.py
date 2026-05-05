@@ -307,7 +307,7 @@ def detect_server_status(page) -> str:
     返回: "running" | "stopped" | "starting" | "stopping" | "hibernating" | "unknown"
     """
     status = page.evaluate("""() => {
-        // --- 新增：检测休眠状态 ---
+        // --- 新增：检测休眠状态逻辑 ---
         const bodyText = document.body.innerText;
         if (bodyText.includes('SERVER CURRENTLY IN HIBERNATION') || bodyText.includes('WAKE UP SERVER')) {
             return 'hibernating';
@@ -362,26 +362,26 @@ def wait_for_status_change(page, target_status: str, max_wait: int = 60000) -> s
     return detect_server_status(page)
 
 
-# ── 新增：唤醒动作 ─────────────────────────────────────
+# ── 新增：唤醒操作动作 ──────────────────────────────────
 def send_wake_up_command(page) -> bool:
-    """点击页面上的 WAKE UP SERVER 按钮"""
-    log_info("尝试执行 WAKE UP 唤醒操作...")
+    """点击唤醒按钮"""
+    log_info("尝试触发 WAKE UP SERVER 唤醒按钮...")
     try:
-        # 寻找包含 "WAKE UP SERVER" 的按钮
+        # 尝试通过文本定位按钮
         btn = page.locator('button:has-text("WAKE UP SERVER")').first
         if btn.is_visible():
             btn.click()
-            log_info("成功点击唤醒按钮")
+            log_info("已成功点击 WAKE UP SERVER 按钮")
             return True
         else:
-            # 备选：通过图标搜索按钮
+            # 备选：通过图标搜索对应的黄色按钮
             btn_alt = page.locator('button i.fa-rocket').locator('xpath=..').first
             if btn_alt.is_visible():
                 btn_alt.click()
-                log_info("通过图标找到并点击了唤醒按钮")
+                log_info("通过图标搜索点击了唤醒按钮")
                 return True
     except Exception as e:
-        log_warn(f"唤醒按钮点击异常: {e}")
+        log_warn(f"唤醒按钮执行异常: {e}")
     return False
 
 
@@ -493,29 +493,35 @@ def process_server(page, server_id: str) -> dict:
 
         current_state = detect_server_status(page)
         result["before_state"] = current_state
-        log_info(f"[{tag}] 初始状态: {current_state}")
+        log_info(f"[{tag}] 初始检测状态: {current_state}")
 
-        # --- 新增：处理休眠状态 ---
+        # --- 第一阶段：如果发现休眠，尝试唤醒 ---
         if current_state == "hibernating":
-            log_info(f"[{tag}] 服务器处于休眠，尝试唤醒...")
+            log_info(f"[{tag}] 服务器处于休眠，正在执行唤醒...")
             if send_wake_up_command(page):
-                # 唤醒后页面可能需要加载一段时间，等待 10 秒并重新获取状态
-                page.wait_for_timeout(10000)
+                page.wait_for_timeout(10000) # 等待唤醒动作生效
                 current_state = detect_server_status(page)
-                log_info(f"[{tag}] 唤醒点击后的状态为: {current_state}")
+                log_info(f"[{tag}] 唤醒后的即时状态: {current_state}")
+                
+                # 核心逻辑改动：如果点击唤醒后直接运行了，就没必要再重启
+                if current_state == "running":
+                    log_info(f"[{tag}] 唤醒后已成功运行，跳过后续电源指令。")
+                    result.update(status="wake_success", emoji="✅", status_label="唤醒成功",
+                                  detail=f"休眠中 → 已唤醒并自动运行")
+                    return result
             else:
-                log_warn(f"[{tag}] 无法点击唤醒按钮")
+                log_warn(f"[{tag}] 未能触发唤醒，将尝试直接发送电源指令...")
 
-        # --- 后续正常电源逻辑 ---
+        # --- 第二阶段：如果没在运行，或者初始就是运行状态(执行例行重启) ---
         if current_state == "running":
-            log_info(f"[{tag}] 服务器运行中，执行重启...")
+            # 如果初始状态不是休眠且正在运行，按原始代码执行“重启”
+            log_info(f"[{tag}] 服务器处于运行状态，执行例行重启...")
             success = send_power_command_via_page(page, "restart")
             if success:
-                page.wait_for_timeout(5000)
-                page.wait_for_timeout(10000)
+                page.wait_for_timeout(15000)
                 after_state = detect_server_status(page)
                 result["after_state"] = after_state
-                log_info(f"[{tag}] 重启后状态: {after_state}")
+                log_info(f"[{tag}] 重启后最终状态: {after_state}")
 
                 if after_state in ("running", "starting"):
                     result.update(status="restarted", emoji="🔄", status_label="重启成功",
@@ -525,75 +531,38 @@ def process_server(page, server_id: str) -> dict:
                                   detail=f"{_state_cn('running')} → 重启 → {_state_cn(after_state)}")
             else:
                 result.update(status="restart_failed", emoji="❌", status_label="重启失败",
-                              detail="无法触发重启命令")
+                              detail="无法通过 JS 或按钮触发重启")
 
-        elif current_state == "stopped" or (result["before_state"] == "hibernating" and current_state != "running"):
-            # 如果一开始是休眠，唤醒后通常是 stopped，所以此时需要执行开机
-            log_info(f"[{tag}] 服务器处于离线/已唤醒，执行开机...")
-            success = send_power_command_via_page(page, "start")
-            if success:
-                page.wait_for_timeout(5000)
-                after_state = wait_for_status_change(page, "running", max_wait=60000)
-                result["after_state"] = after_state
-                log_info(f"[{tag}] 开机后状态: {after_state}")
-
-                if after_state in ("running", "starting"):
-                    result.update(status="started", emoji="✅", status_label="开机成功",
-                                  detail=f"{_state_cn('stopped')} → 开机 → {_state_cn(after_state)}")
-                else:
-                    result.update(status="start_uncertain", emoji="⚠️", status_label="开机状态不确定",
-                                  detail=f"{_state_cn('stopped')} → 开机 → {_state_cn(after_state)}")
-            else:
-                result.update(status="start_failed", emoji="❌", status_label="开机失败",
-                              detail="无法触发开机命令")
-
-        elif current_state in ("starting", "stopping"):
-            log_info(f"[{tag}] 服务器处于过渡状态 ({current_state})，等待稳定...")
-            page.wait_for_timeout(15000)
-            stable_state = detect_server_status(page)
-            log_info(f"[{tag}] 等待后状态: {stable_state}")
-
-            if stable_state == "running":
-                log_info(f"[{tag}] 服务器已运行，执行重启...")
-                success = send_power_command_via_page(page, "restart")
-                if success:
-                    page.wait_for_timeout(15000)
-                    after_state = detect_server_status(page)
-                    result["after_state"] = after_state
-                    result.update(status="restarted", emoji="🔄", status_label="重启成功",
-                                  detail=f"{_state_cn(current_state)} → {_state_cn('running')} → 重启 → {_state_cn(after_state)}")
-                else:
-                    result.update(status="restart_failed", emoji="❌", status_label="重启失败",
-                                  detail=f"等待后{_state_cn('running')}，但无法触发重启")
-            elif stable_state == "stopped":
-                log_info(f"[{tag}] 服务器已关机，执行开机...")
-                success = send_power_command_via_page(page, "start")
-                if success:
-                    page.wait_for_timeout(5000)
-                    after_state = wait_for_status_change(page, "running", max_wait=60000)
-                    result["after_state"] = after_state
-                    result.update(status="started", emoji="✅", status_label="开机成功",
-                                  detail=f"{_state_cn(current_state)} → {_state_cn('stopped')} → 开机 → {_state_cn(after_state)}")
-                else:
-                    result.update(status="start_failed", emoji="❌", status_label="开机失败",
-                                  detail=f"等待后{_state_cn('stopped')}，但无法触发开机")
-            else:
-                result.update(status="transition", emoji="⏳", status_label="状态过渡中",
-                              detail=f"{_state_cn(current_state)} → {_state_cn(stable_state)}")
-
-        else:
-            log_warn(f"[{tag}] 无法确定服务器状态: {current_state}")
-            log_info(f"[{tag}] 尝试执行开机...")
+        elif current_state in ("stopped", "hibernating", "unknown"):
+            # 如果唤醒后是停止状态，或者本来就是关机，执行开机
+            log_info(f"[{tag}] 服务器目前处于离线/休眠，执行开机指令...")
             success = send_power_command_via_page(page, "start")
             if success:
                 page.wait_for_timeout(10000)
-                after_state = detect_server_status(page)
+                after_state = wait_for_status_change(page, "running", max_wait=60000)
                 result["after_state"] = after_state
-                result.update(status="attempted_start", emoji="❓", status_label="尝试开机",
-                              detail=f"{_state_cn('unknown')} → 尝试开机 → {_state_cn(after_state)}")
+                
+                # 如果开机后居然又回到了休眠，说明需要二次唤醒
+                if after_state == "hibernating":
+                    log_info(f"[{tag}] 开机指令后变回休眠，补点一次唤醒按钮...")
+                    send_wake_up_command(page)
+                    page.wait_for_timeout(5000)
+                    after_state = detect_server_status(page)
+
+                result.update(status="started", emoji="✅", status_label="电源指令成功",
+                              detail=f"{_state_cn(current_state)} → 开机指令 → {_state_cn(after_state)}")
             else:
-                result.update(status="unknown", emoji="❓", status_label="状态未知",
-                              detail="无法确定状态且无法操作")
+                result.update(status="start_failed", emoji="❌", status_label="开机指令失败",
+                              detail="无法通过按钮触发开机")
+
+        elif current_state in ("starting", "stopping"):
+            log_info(f"[{tag}] 处于过渡状态，执行原始等待逻辑...")
+            page.wait_for_timeout(15000)
+            stable_state = detect_server_status(page)
+            result.update(status="transition", emoji="⏳", status_label="状态过渡中",
+                          detail=f"{_state_cn(current_state)} → 等待后为 {_state_cn(stable_state)}")
+        else:
+            result.update(status="unknown", emoji="❓", status_label="状态未知", detail="无法执行有效操作")
 
     except Exception as e:
         log_error(f"[{tag}] 异常: {e}")
@@ -623,7 +592,7 @@ def build_tg_message(display_name: str, results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-#  主流程
+#  主流程（完整保留原始登录与发现逻辑）
 def run():
     global _RAW_EMAIL
 
